@@ -34,6 +34,55 @@ constexpr size_t B = 64;
 struct Hash { size_t operator()(SV s) const { return std::hash<SV>{}(s); } };
 template<class V> using Map = std::unordered_map<SV, V, Hash>;
 
+// A flat table keeps entries in one contiguous array rather than separately
+// allocated nodes. Hashes locate candidates; complete strings decide equality.
+// NONE is reserved, so every valid person number is also an occupancy marker.
+class FlatIds {
+    struct Entry { SV key{}; uint32_t value=NONE, tag=0; };
+    std::vector<Entry> slots;
+    size_t used=0;
+    void put(SV key,uint32_t value,size_t hash) {
+        size_t i=hash&(slots.size()-1);
+        while(slots[i].value!=NONE) {
+            if(slots[i].tag==uint32_t(hash>>32) && slots[i].key==key) {
+                slots[i].value=value;return;
+            }
+            i=(i+1)&(slots.size()-1);
+        }
+        slots[i]=Entry{key,value,uint32_t(hash>>32)};++used;
+    }
+    void grow(size_t count) {
+        auto old=std::move(slots);
+        slots=std::vector<Entry>(count);used=0;
+        for(const auto& e:old)if(e.value!=NONE)
+            put(e.key,e.value,Hash{}(e.key)>>shift);
+    }
+    unsigned shift=0;
+public:
+    explicit FlatIds(unsigned dropped_bits=0):shift(dropped_bits){}
+    void reserve(size_t n) {
+        size_t count=16;while(count<n+n/2+1)count*=2;
+        if(count>slots.size())grow(count);
+    }
+    uint32_t find(SV key,size_t hash) const {
+        if(slots.empty())return NONE;
+        hash>>=shift;
+        size_t i=hash&(slots.size()-1);
+        uint32_t tag=hash>>32;
+        while(slots[i].value!=NONE) {
+            if(slots[i].tag==tag && slots[i].key==key)return slots[i].value;
+            i=(i+1)&(slots.size()-1);
+        }
+        return NONE;
+    }
+    void insert(SV key,uint32_t value,size_t hash) {
+        if(value==NONE)throw std::runtime_error("invalid person ID sentinel");
+        if(slots.empty())grow(16);
+        else if((used+1)*10>=slots.size()*7)grow(slots.size()*2);
+        put(key,value,hash>>shift);
+    }
+};
+
 // Compare UTF-8 as unsigned bytes, independent of locale and signed-char rules.
 bool byte_less(SV a, SV b) {
     int c = std::memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
@@ -173,25 +222,36 @@ struct DSU {
 };
 struct People {
     Map<uint32_t> linked; std::vector<SV> known_names;
-    struct Shard { std::mutex mu; Map<uint32_t> ids; std::vector<SV> names; };
+    FlatIds flat_linked;
+    bool flat;
+    // Low six hash bits select a shard. Drop those same fixed bits before
+    // indexing a shard's flat table; otherwise every entry starts in 1/64
+    // of the slots, creating long probe clusters.
+    struct Shard { std::mutex mu; Map<uint32_t> ids; FlatIds flat_ids{6}; std::vector<SV> names; };
     std::array<Shard,B> shards;
-    explicit People(DSU& d) {
+    explicit People(DSU& d,bool use_flat):flat(use_flat) {
         std::vector<uint32_t> roots(d.names.size(),NONE);
-        linked.reserve(d.names.size()*1.2);
+        if(flat)flat_linked.reserve(d.names.size());
+        else linked.reserve(d.names.size()*1.2);
         for (uint32_t i=0;i<d.names.size();++i) {
             auto r=d.root(i);
             if (roots[r]==NONE) { roots[r]=known_names.size(); known_names.push_back(d.names[d.least[r]]); }
-            linked.emplace(d.names[i],roots[r]);
+            if(flat)flat_linked.insert(d.names[i],roots[r],Hash{}(d.names[i]));
+            else linked.emplace(d.names[i],roots[r]);
         }
     }
-    uint32_t get(SV s) {
-        auto it=linked.find(s); if (it!=linked.end()) return it->second;
-        size_t b=Hash{}(s)&(B-1); auto& sh=shards[b];
+    uint32_t get(SV s,size_t hash) {
+        if(flat) { auto p=flat_linked.find(s,hash);if(p!=NONE)return p; }
+        else { auto it=linked.find(s); if (it!=linked.end()) return it->second; }
+        size_t b=hash&(B-1); auto& sh=shards[b];
         std::lock_guard<std::mutex> lock(sh.mu);
-        auto found=sh.ids.find(s); if (found!=sh.ids.end()) return found->second;
+        if(flat) { auto p=sh.flat_ids.find(s,hash);if(p!=NONE)return p; }
+        else { auto found=sh.ids.find(s); if (found!=sh.ids.end()) return found->second; }
         uint64_t id=known_names.size()+sh.names.size()*B+b;
         if (id>=NONE) throw std::runtime_error("too many people");
-        sh.names.push_back(s); sh.ids.emplace(s,id); return id;
+        sh.names.push_back(s);
+        if(flat)sh.flat_ids.insert(s,id,hash);else sh.ids.emplace(s,id);
+        return id;
     }
     std::vector<SV> names() {
         size_t n=known_names.size();
@@ -205,9 +265,14 @@ struct People {
 };
 struct LocalPeople {
     People& people; Map<uint32_t> cache;
+    FlatIds flat_cache;
     uint32_t get(SV s) {
+        if(people.flat) {
+            size_t h=Hash{}(s);auto p=flat_cache.find(s,h);if(p!=NONE)return p;
+            p=people.get(s,h);flat_cache.insert(s,p,h);return p;
+        }
         auto it=cache.find(s); if(it!=cache.end()) return it->second;
-        auto id=people.get(s); cache.emplace(s,id); return id;
+        auto id=people.get(s,Hash{}(s)); cache.emplace(s,id); return id;
     }
 };
 struct Task { const char* p; const char* end; };
@@ -279,7 +344,11 @@ int main(int argc,char** argv) { try {
     for(auto& m:link_maps)data_lines(m,[&](SV line) {
         std::array<SV,2> f; if(parse(line,f) && !f[0].empty() && !f[1].empty())d.join(f[0],f[1]);
     });
-    People people(d);
+    const char* lookup=std::getenv("SHOPPING_LOOKUP");
+    bool use_flat=!lookup || std::string_view(lookup)=="flat";
+    if(lookup && std::string_view(lookup)!="flat" && std::string_view(lookup)!="std")
+        throw std::runtime_error("SHOPPING_LOOKUP must be flat or std");
+    People people(d,use_flat);
     // Drop the construction-only DSU once the immutable identity map is ready.
     d=DSU{};
     Mapping products(data/"products.csv"), campaigns(data/"campaigns.csv");
@@ -294,7 +363,7 @@ int main(int argc,char** argv) { try {
     auto jobs=tasks(event_maps);
     std::vector<Buckets<RawEvent>> raw(nt);
     std::vector<LocalPeople> locals; locals.reserve(nt);
-    for(unsigned t=0;t<nt;++t)locals.push_back(LocalPeople{people,{}});
+    for(unsigned t=0;t<nt;++t)locals.push_back(LocalPeople{people,{},FlatIds{}});
     parallel(jobs.size(),nt,[&](unsigned t,size_t j) {
         lines(jobs[j].p,jobs[j].end,[&](SV line) {
             std::array<SV,7> f; if(!parse(line,f) || f[0].empty())return;

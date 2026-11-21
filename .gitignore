@@ -13,3 +13,7 @@ dev-answer*.zip
 out-*/
 logs/
 Dockerfile.backup-*
+bench-data/
+bench-output/
+core-*
+bench-backups/
