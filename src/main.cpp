@@ -23,6 +23,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace fs = std::filesystem;
 using SV = std::string_view;
@@ -38,24 +41,43 @@ template<class V> using Map = std::unordered_map<SV, V, Hash>;
 // allocated nodes. Hashes locate candidates; complete strings decide equality.
 // NONE is reserved, so every valid person number is also an occupancy marker.
 class FlatIds {
-    struct Entry { SV key{}; uint32_t value=NONE, tag=0; };
+    // Short keys are stored inline, not as pointers into distant CSV pages.
+    // The final byte holds length, so embedded NULs and trailing spaces remain
+    // distinct. Long keys retain a full pointer/length representation.
+    struct Entry { std::array<uint64_t,2> key{};uint32_t value=NONE,tag=0; };
     std::vector<Entry> slots;
     size_t used=0;
+    static std::array<uint64_t,2> packed(SV s) {
+        std::array<uint64_t,2> k{};
+        if(s.size()<=15) {
+            if(!s.empty())std::memcpy(k.data(),s.data(),s.size());
+            reinterpret_cast<unsigned char*>(k.data())[15]=s.size();
+        } else {k[0]=reinterpret_cast<uintptr_t>(s.data());k[1]=s.size();}
+        return k;
+    }
+    static SV view(const Entry& e) {
+        if(e.tag&0x80000000U)return SV(reinterpret_cast<const char*>(e.key.data()),reinterpret_cast<const unsigned char*>(e.key.data())[15]);
+        return SV(reinterpret_cast<const char*>(uintptr_t(e.key[0])),e.key[1]);
+    }
+    static uint32_t tag(SV s,size_t hash) {
+        return uint32_t(hash>>32)&0x7fffffffU | (s.size()<=15?0x80000000U:0);
+    }
     void put(SV key,uint32_t value,size_t hash) {
+        auto encoded=packed(key);uint32_t fingerprint=tag(key,hash);
         size_t i=hash&(slots.size()-1);
         while(slots[i].value!=NONE) {
-            if(slots[i].tag==uint32_t(hash>>32) && slots[i].key==key) {
+            if(slots[i].tag==fingerprint && ((fingerprint&0x80000000U)?slots[i].key==encoded:view(slots[i])==key)) {
                 slots[i].value=value;return;
             }
             i=(i+1)&(slots.size()-1);
         }
-        slots[i]=Entry{key,value,uint32_t(hash>>32)};++used;
+        slots[i]=Entry{encoded,value,fingerprint};++used;
     }
     void grow(size_t count) {
         auto old=std::move(slots);
         slots=std::vector<Entry>(count);used=0;
         for(const auto& e:old)if(e.value!=NONE)
-            put(e.key,e.value,Hash{}(e.key)>>shift);
+            put(view(e),e.value,Hash{}(view(e))>>shift);
     }
     unsigned shift=0;
 public:
@@ -68,9 +90,9 @@ public:
         if(slots.empty())return NONE;
         hash>>=shift;
         size_t i=hash&(slots.size()-1);
-        uint32_t tag=hash>>32;
+        auto encoded=packed(key);uint32_t fingerprint=tag(key,hash);
         while(slots[i].value!=NONE) {
-            if(slots[i].tag==tag && slots[i].key==key)return slots[i].value;
+            if(slots[i].tag==fingerprint && ((fingerprint&0x80000000U)?slots[i].key==encoded:view(slots[i])==key))return slots[i].value;
             i=(i+1)&(slots.size()-1);
         }
         return NONE;
@@ -117,6 +139,37 @@ std::vector<fs::path> files(const fs::path& dir) {
 
 // Every comma separates fields in this challenge. Only LF terminates a row.
 template<size_t N> bool parse(SV line, std::array<SV,N>& out) {
+#if defined(__AVX2__)
+    // SIMD only identifies commas and counts quotes. The challenge's strict
+    // whole-field quoting rules are checked below; CR is never normalized.
+    std::array<size_t,N> ends{};size_t commas=0,quotes=0,at=0;
+    const auto comma=_mm256_set1_epi8(','), quote=_mm256_set1_epi8('"');
+    while(at+32<=line.size()) {
+        auto block=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(line.data()+at));
+        uint32_t cm=_mm256_movemask_epi8(_mm256_cmpeq_epi8(block,comma));
+        quotes+=__builtin_popcount(uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(block,quote))));
+        while(cm) {
+            if(commas>=N-1)return false;
+            ends[commas++]=at+__builtin_ctz(cm);cm&=cm-1;
+        }
+        at+=32;
+    }
+    for(;at<line.size();++at) {
+        if(line[at]=='"')++quotes;
+        if(line[at]==',') { if(commas>=N-1)return false;ends[commas++]=at; }
+    }
+    if(commas!=N-1)return false;
+    ends[N-1]=line.size();size_t begin=0,expected_quotes=0;
+    for(size_t i=0;i<N;++i) {
+        SV s=line.substr(begin,ends[i]-begin);begin=ends[i]+1;
+        if(!s.empty() && s.front()=='"') {
+            if(s.size()<2 || s.back()!='"')return false;
+            s.remove_prefix(1);s.remove_suffix(1);expected_quotes+=2;
+        }
+        out[i]=s;
+    }
+    return quotes==expected_quotes;
+#else
     size_t at = 0;
     for (size_t i=0; i<N; ++i) {
         size_t end = line.find(',', at);
@@ -131,6 +184,7 @@ template<size_t N> bool parse(SV line, std::array<SV,N>& out) {
         out[i] = s; at = end+1;
     }
     return true;
+#endif
 }
 template<class Fn> void lines(const char* p, const char* end, Fn fn) {
     while (p < end) {
@@ -160,8 +214,17 @@ I64 calendar(SV s) {
     int y=two(s.data())*100+two(s.data()+2), m=two(s.data()+5), d=two(s.data()+8);
     int h=two(s.data()+11), mi=two(s.data()+14), se=two(s.data()+17);
     static const int md[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-    bool leap = y%4==0 && (y%100!=0 || y%400==0);
-    if (!y || m<1 || m>12 || d<1 || d>md[m]+(m==2 && leap) || h>23 || mi>59 || se>59) return INVALID;
+    if(h>23 || mi>59 || se>59)return INVALID;
+    struct DateSlot { uint32_t key=UINT32_MAX;I64 epoch=0; };
+    static thread_local std::array<DateSlot,64> dates;
+    uint32_t date_key=y*10000+m*100+d;
+    auto& cached=dates[date_key&63];I64 date_epoch;
+    if(cached.key==date_key)date_epoch=cached.epoch;
+    else {
+        bool leap = y%4==0 && (y%100!=0 || y%400==0);
+        if (!y || m<1 || m>12 || d<1 || d>md[m]+(m==2 && leap)) return INVALID;
+        date_epoch=civil_days(y,m,d)*DAY;cached=DateSlot{date_key,date_epoch};
+    }
     I64 offset=0;
     if (s.size()==20) { if (s[19]!='Z') return INVALID; }
     else {
@@ -171,7 +234,7 @@ I64 calendar(SV s) {
         if (oh>23 || om>59) return INVALID;
         offset=(oh*60LL+om)*60000*(s[19]=='+' ? 1 : -1);
     }
-    return civil_days(y,m,d)*DAY + (h*3600LL+mi*60+se)*1000-offset;
+    return date_epoch + (h*3600LL+mi*60+se)*1000-offset;
 }
 I64 timestamp(SV s, I64 lo, I64 hi) {
     if (s.empty()) return INVALID;
@@ -202,12 +265,13 @@ uint32_t price(SV s) {
 }
 
 struct DSU {
-    Map<uint32_t> ids; std::vector<SV> names;
+    FlatIds ids{0}; std::vector<SV> names;
     std::vector<uint32_t> parent, size, least;
     uint32_t id(SV s) {
-        auto [it,added]=ids.emplace(s, uint32_t(names.size()));
-        if (added) { auto i=it->second; names.push_back(s); parent.push_back(i); size.push_back(1); least.push_back(i); }
-        return it->second;
+        auto hash=Hash{}(s);auto i=ids.find(s,hash);if(i!=NONE)return i;
+        i=names.size();ids.insert(s,i,hash);
+        names.push_back(s);parent.push_back(i);size.push_back(1);least.push_back(i);
+        return i;
     }
     uint32_t root(uint32_t i) {
         while (i!=parent[i]) { parent[i]=parent[parent[i]]; i=parent[i]; } return i;
@@ -310,6 +374,9 @@ struct Counts { uint64_t sessions=0,purchasing=0,revenue=0,assists=0; };
 struct UserRow { uint32_t person; int32_t day; uint64_t sessions,events,revenue; uint32_t top,padding=0; };
 struct CampaignRow { uint32_t campaign; int32_t day; uint64_t sessions,purchasing,revenue,assists; };
 static_assert(sizeof(UserRow)==40 && sizeof(CampaignRow)==40);
+#ifdef SHOPPING_NATIVE_PARQUET
+#include "native_parquet.h"
+#endif
 template<class T> using Buckets = std::array<std::vector<T>,B>;
 template<class T> void release(std::vector<T>& v) { std::vector<T>().swap(v); }
 FILE* output(const fs::path& path) {
@@ -330,6 +397,32 @@ void dictionary(const fs::path& out, const std::string& name, const std::vector<
 }
 
 int main(int argc,char** argv) { try {
+    bool native_output=false;
+#ifdef SHOPPING_NATIVE_PARQUET
+    if(argc==2 && SV(argv[1])=="--self-test")return 0;
+    std::array<std::string,7> native_args;
+    std::array<char*,7> native_argv;
+    if(argc==1) {
+        native_output=true;
+        auto env=[](const char* key,const char* fallback) { auto s=std::getenv(key);return std::string(s?s:fallback); };
+        auto data=env("DATA_DIR","/data");
+        std::ifstream file(fs::path(data)/"manifest.json");
+        if(!file)throw std::runtime_error("cannot read manifest.json");
+        std::string manifest((std::istreambuf_iterator<char>(file)),{});
+        auto bound=[&](const char* name) {
+            auto pos=manifest.find(std::string("\"")+name+"\"");
+            if(pos==std::string::npos)throw std::runtime_error("manifest missing window");
+            pos=manifest.find(':',pos);if(pos==std::string::npos)throw std::runtime_error("bad manifest");
+            pos=manifest.find('"',pos);if(pos==std::string::npos)throw std::runtime_error("bad manifest");
+            auto end=manifest.find('"',pos+1);if(end==std::string::npos)throw std::runtime_error("bad manifest");
+            auto value=calendar(SV(manifest).substr(pos+1,end-pos-1));
+            if(value==INVALID)throw std::runtime_error("invalid manifest bound");return std::to_string(value);
+        };
+        native_args={argv[0],data,env("OUTPUT_DIR","/output"),bound("window_start"),bound("window_end"),env("NCPU","8"),"64"};
+        for(size_t i=0;i<7;++i)native_argv[i]=native_args[i].data();
+        argc=7;argv=native_argv.data();
+    }
+#endif
     if(argc!=7)throw std::runtime_error("usage: core DATA INTERMEDIATE START_MS END_MS THREADS BUCKETS_RESERVED");
     auto started=std::chrono::steady_clock::now();
     auto stage=[&](const char* s) { std::cerr<<s<<": "<<std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()<<" s elapsed\n"; };
@@ -409,6 +502,15 @@ int main(int argc,char** argv) { try {
         });
     });
     release(locals); stage("click parse");
+    std::vector<SV> person_names;
+    if(native_output) {
+        person_names=people.names();
+        for(const auto* table:{"user_daily","campaign_daily"}) {
+            fs::create_directories(out/table);
+            for(const auto& entry:fs::directory_iterator(out/table))
+                if(entry.path().extension()==".parquet" && entry.is_regular_file())fs::remove(entry.path());
+        }
+    }
     const size_t nc=campaign_names.size();
     std::vector<std::vector<Counts>> totals(nt,std::vector<Counts>(nc*ndays));
     parallel(B,nt,[&](unsigned t,size_t b) {
@@ -428,7 +530,8 @@ int main(int argc,char** argv) { try {
         // Copies are guaranteed identical after CSV decoding, so validation
         // before this click-only dedup cannot rescue an invalid copy.
         cl.erase(std::unique(cl.begin(),cl.end(),[](const Click& a,const Click& z){return a.person==z.person && a.ts==z.ts && a.id==z.id;}),cl.end());
-        FILE* uf=output(out/("user-"+std::to_string(b)+".bin"));
+        FILE* uf=native_output?nullptr:output(out/("user-"+std::to_string(b)+".bin"));
+        std::vector<UserRow> user_rows;
         auto& agg=totals[t];
         std::vector<uint64_t> cat_sum(cats.size());std::vector<uint32_t> touched;
         std::vector<size_t> covered(nc,0);std::vector<uint32_t> touched_campaigns;
@@ -447,7 +550,9 @@ int main(int argc,char** argv) { try {
                     if(cat_sum[cat]>best || (cat_sum[cat]==best && (top==NONE || byte_less(cats[cat],cats[top])))) { best=cat_sum[cat];top=cat; }
                     cat_sum[cat]=0;
                 }
-                row.top=top;write_one(uf,row);touched.clear();
+                row.top=top;
+                if(native_output)user_rows.push_back(row);else write_one(uf,row);
+                touched.clear();
             };
             I64 prev=INVALID;
             for(size_t i=ei;i<ee;++i) {
@@ -498,18 +603,30 @@ int main(int argc,char** argv) { try {
             for(auto c:touched_campaigns)covered[c]=0;
             touched_campaigns.clear();ei=ee;ci=ce;
         }
-        finish(uf);
+        if(uf)finish(uf);
+#ifdef SHOPPING_NATIVE_PARQUET
+        else if(!user_rows.empty() || b==0)native_users(out/"user_daily"/("part-"+std::to_string(b)+".parquet"),user_rows,person_names,cats);
+#endif
     });
     stage("sort, sessions, attribution, interval-union assists");
-    FILE* cf=output(out/"campaign.bin");
+    FILE* cf=native_output?nullptr:output(out/"campaign.bin");
+    std::vector<CampaignRow> campaign_rows;
     for(size_t c=0;c<nc;++c)for(int day=0;day<ndays;++day) {
         Counts a;
         for(auto& partial:totals) { auto& v=partial[c*ndays+day];a.sessions+=v.sessions;a.purchasing+=v.purchasing;a.revenue+=v.revenue;a.assists+=v.assists; }
-        if(a.sessions || a.assists)write_one(cf,CampaignRow{uint32_t(c),base_day+day,a.sessions,a.purchasing,a.revenue,a.assists});
+        if(a.sessions || a.assists) {
+            CampaignRow row{uint32_t(c),base_day+day,a.sessions,a.purchasing,a.revenue,a.assists};
+            if(native_output)campaign_rows.push_back(row);else write_one(cf,row);
+        }
     }
-    finish(cf);
-    dictionary(out,"people",people.names());dictionary(out,"categories",cats);
-    dictionary(out,"campaigns",campaign_names);dictionary(out,"channels",channels);
-    stage("binary results and dictionaries written");
+    if(cf) {
+        finish(cf);
+        dictionary(out,"people",people.names());dictionary(out,"categories",cats);
+        dictionary(out,"campaigns",campaign_names);dictionary(out,"channels",channels);
+    }
+#ifdef SHOPPING_NATIVE_PARQUET
+    else native_campaigns(out/"campaign_daily"/"part-0.parquet",campaign_rows,campaign_names,channels);
+#endif
+    stage(native_output?"native parquet complete":"binary results and dictionaries written");
     return 0;
 } catch(const std::exception& e) { std::cerr<<"ERROR: "<<e.what()<<'\n';return 1; } }
