@@ -1,0 +1,5 @@
+FROM rust:1.85-bookworm AS generator
+WORKDIR /generator
+COPY tools/generator/ ./
+RUN cargo build --release --locked
+ENTRYPOINT ["/generator/target/release/generate"]

@@ -1,0 +1,15 @@
+core
+core-asan
+dev/
+out/
+scratch/
+dev-answer/
+__pycache__/
+.venv/
+*.pyc
+tools/generator/target/
+.DS_Store
+dev-answer*.zip
+out-*/
+logs/
+Dockerfile.backup-*
